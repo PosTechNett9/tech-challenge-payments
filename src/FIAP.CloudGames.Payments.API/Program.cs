@@ -78,7 +78,13 @@ builder.Services.AddAuthentication("Bearer")
 
 var app = builder.Build();
 
-app.UsePathBase("/users");
+using (var scope = app.Services.CreateScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<PaymentsDbContext>();
+    db.Database.Migrate();
+}
+
+app.UsePathBase("/payments");
 app.UseRouting();
 
 // Middlewares
