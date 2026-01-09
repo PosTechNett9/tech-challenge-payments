@@ -12,6 +12,8 @@ using FIAP.CloudGames.Payments.Infrastructure.Messaging;
 using FIAP.CloudGames.Payments.Infrastructure.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
+using Amazon.SQS;
+using Microsoft.OpenApi.Models;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using Serilog;
@@ -142,9 +144,23 @@ app.MapGet("/health", () => Results.Ok("OK")).AllowAnonymous();
 
 if (app.Environment.IsDevelopment())
 {
-    app.UseSwagger();
+
+    var swaggerBasePath = builder.Configuration["SwaggerBasePath"] ?? "/payments";
+
+    app.UseSwagger(c =>
+    {
+        c.PreSerializeFilters.Add((swagger, req) =>
+        {
+            swagger.Servers = new List<OpenApiServer>
+            {
+                new OpenApiServer { Url = swaggerBasePath }
+            };
+        });
+    });
+
     app.UseSwaggerUI(c =>
     {
+        c.RoutePrefix = "swagger";
         c.SwaggerEndpoint("v1/swagger.json", "Payments API v1");
     });
 }
