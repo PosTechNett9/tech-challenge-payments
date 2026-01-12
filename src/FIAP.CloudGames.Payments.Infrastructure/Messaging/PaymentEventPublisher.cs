@@ -22,22 +22,22 @@ namespace FIAP.CloudGames.Payments.Infrastructure.Messaging
 
         public async Task PublishPaymentCreatedAsync(Payment payment)
         {
-            var message = new
-            {
-                paymentId = payment.Id,
-                orderId = payment.OrderId,
-                userId = payment.UserId,
-                amount = payment.Amount,
-                createdAt = payment.CreatedAt
-            };
+        //    var message = new
+        //    {
+        //        paymentId = payment.Id,
+        //        orderId = payment.OrderId,
+        //        userId = payment.UserId,
+        //        amount = payment.Amount,
+        //        createdAt = payment.CreatedAt
+        //    };
 
-            var request = new SendMessageRequest
-            {
-                QueueUrl = _queueUrl,
-                MessageBody = JsonSerializer.Serialize(message)
-            };
+        //    var request = new SendMessageRequest
+        //    {
+        //        QueueUrl = _queueUrl,
+        //        MessageBody = JsonSerializer.Serialize(message)
+        //    };
 
-            await _sqs.SendMessageAsync(request);
+        //    await _sqs.SendMessageAsync(request);
         }
     }
 }
