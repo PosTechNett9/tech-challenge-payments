@@ -225,11 +225,11 @@ jobs:
           ls -lah "$GITHUB_WORKSPACE/payments-processor.zip"
 
       - name: Create or Update Lambda
+        env:
+          CONN_STR: ${{ secrets.PAYMENTS_CONNECTION_STRING }}
         run: |
           set -euo pipefail
           ZIP="$GITHUB_WORKSPACE/payments-processor.zip"
-          
-          CONN_STR="Server=tech-challenge-payments.cauxpuca0lvv.us-east-1.rds.amazonaws.com,1433;Database=tech-challenge-payments;User Id=admin;Password=FCG_Password;TrustServerCertificate=True;"
 
           if aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" >/dev/null 2>&1; then
             echo "Updating Lambda code: $LAMBDA_FUNCTION_NAME"
