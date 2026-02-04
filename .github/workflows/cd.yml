@@ -12,15 +12,20 @@ jobs:
     env:
       AWS_REGION: us-east-1
       
-      SQS_QUEUE_NAME: fcg-payments-queue
+      # SNS Topic
+      SNS_TOPIC_NAME: fcg-payment-events
       
+      # SQS Queue
+      SQS_QUEUE_NAME: fcg-payment-events-queue
+      
+      # Lambda
+      LAMBDA_FUNCTION_NAME: fcg-payments-processor
       LAMBDA_HANDLER: PaymentsProcessor.Function::PaymentsProcessor.Function.Function::FunctionHandler
+      LAMBDA_ROLE_ARN: arn:aws:iam::558329071611:role/LabRole
       
+      # ECS
       ECS_CLUSTER: fcg-cluster
       ECS_SERVICE: fcg-payments-task-service-rfv89au5
-      
-      ECS_ENV_QUEUE_KEY: Sqs__QueueUrl
-      ECS_ENV_REGION_KEY: AWS__Region
 
     steps:
       - name: Checkout code
@@ -85,60 +90,94 @@ jobs:
           echo "/home/runner/.dotnet/tools" >> $GITHUB_PATH
           sudo apt-get update
           sudo apt-get install -y jq
+          
+      - name: Ensure SNS Topic
+        id: sns
+        run: |
+          set -euo pipefail
+          
+          TOPIC_ARN=$(aws sns list-topics --query "Topics[?contains(TopicArn, '$SNS_TOPIC_NAME')].TopicArn" --output text 2>/dev/null || true)
+          
+          if [ -z "${TOPIC_ARN:-}" ] || [ "${TOPIC_ARN:-}" = "None" ]; then
+            echo "Creating SNS topic: $SNS_TOPIC_NAME"
+            TOPIC_ARN=$(aws sns create-topic \
+              --name "$SNS_TOPIC_NAME" \
+              --query 'TopicArn' \
+              --output text)
+            echo "Topic created: $TOPIC_ARN"
+          else
+            echo "Topic already exists: $TOPIC_ARN"
+          fi
+
+          echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_OUTPUT
 
       - name: Ensure SQS Queue
         id: sqs
         run: |
           set -euo pipefail
-
+          
           QUEUE_URL=$(aws sqs get-queue-url --queue-name "$SQS_QUEUE_NAME" --query 'QueueUrl' --output text 2>/dev/null || true)
+          
           if [ -z "${QUEUE_URL:-}" ] || [ "${QUEUE_URL:-}" = "None" ]; then
-            echo "Creating queue: $SQS_QUEUE_NAME"
+            echo "Creating SQS queue: $SQS_QUEUE_NAME"
             QUEUE_URL=$(aws sqs create-queue \
               --queue-name "$SQS_QUEUE_NAME" \
               --attributes "ReceiveMessageWaitTimeSeconds=20,VisibilityTimeout=300" \
-              --query 'QueueUrl' --output text)
+              --query 'QueueUrl' \
+              --output text)
+            echo "Queue created: $QUEUE_URL"
           else
-            echo "Queue exists: $QUEUE_URL"
+            echo "Queue already exists: $QUEUE_URL"
             aws sqs set-queue-attributes \
               --queue-url "$QUEUE_URL" \
               --attributes "ReceiveMessageWaitTimeSeconds=20,VisibilityTimeout=300" \
               >/dev/null
           fi
-
+          
           QUEUE_ARN=$(aws sqs get-queue-attributes \
             --queue-url "$QUEUE_URL" \
             --attribute-names QueueArn \
             --query 'Attributes.QueueArn' \
             --output text)
-            
+
+          echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_OUTPUT
+          echo "QUEUE_ARN=$QUEUE_ARN" >> $GITHUB_OUTPUT
+
+      - name: Configure SQS Queue Policy (allow SNS to send messages)
+        env:
+          TOPIC_ARN: ${{ steps.sns.outputs.TOPIC_ARN }}
+          QUEUE_URL: ${{ steps.sqs.outputs.QUEUE_URL }}
+          QUEUE_ARN: ${{ steps.sqs.outputs.QUEUE_ARN }}
+        run: |
+          set -euo pipefail
+
           ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
-          POLICY=$(jq -nc --arg qarn "$QUEUE_ARN" --arg acc "$ACCOUNT_ID" '{
+          
+          POLICY=$(jq -nc \
+            --arg qarn "$QUEUE_ARN" \
+            --arg tarn "$TOPIC_ARN" \
+            --arg acc "$ACCOUNT_ID" '{
             Version:"2012-10-17",
             Statement:[
               {
-                Sid:"AllowAccountSendMessage",
+                Sid:"AllowSNSToSendMessage",
+                Effect:"Allow",
+                Principal:{"Service":"sns.amazonaws.com"},
+                Action:["sqs:SendMessage"],
+                Resource:$qarn,
+                Condition:{ 
+                  ArnEquals:{ "aws:SourceArn": $tarn }
+                }
+              },
+              {
+                Sid:"AllowAccountAccess",
                 Effect:"Allow",
                 Principal:"*",
                 Action:["sqs:SendMessage"],
                 Resource:$qarn,
-                Condition:{ StringEquals:{ "aws:PrincipalAccount": $acc } }
-              }
-            ]
-          }')
-
-          ACCOUNT_ID=$(aws sts get-caller-identity --query 'Account' --output text)
-
-          POLICY=$(jq -nc --arg qarn "$QUEUE_ARN" --arg acc "$ACCOUNT_ID" '{
-            Version:"2012-10-17",
-            Statement:[
-              {
-                Sid:"AllowAccountSendMessage",
-                Effect:"Allow",
-                Principal:"*",
-                Action:["sqs:SendMessage"],
-                Resource:$qarn,
-                Condition:{ StringEquals:{ "aws:PrincipalAccount": $acc } }
+                Condition:{ 
+                  StringEquals:{ "aws:PrincipalAccount": $acc }
+                }
               }
             ]
           }')
@@ -151,9 +190,33 @@ jobs:
             --attributes "file://$ATTR_FILE" \
             >/dev/null
 
-          echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_OUTPUT
-          echo "QUEUE_ARN=$QUEUE_ARN" >> $GITHUB_OUTPUT
+          echo "SQS policy configured to accept messages from SNS"
 
+      - name: Subscribe SQS to SNS Topic
+        env:
+          TOPIC_ARN: ${{ steps.sns.outputs.TOPIC_ARN }}
+          QUEUE_ARN: ${{ steps.sqs.outputs.QUEUE_ARN }}
+        run: |
+          set -euo pipefail
+
+          # Verifica se a subscription já existe
+          SUBSCRIPTION_ARN=$(aws sns list-subscriptions-by-topic \
+            --topic-arn "$TOPIC_ARN" \
+            --query "Subscriptions[?Endpoint=='$QUEUE_ARN'].SubscriptionArn" \
+            --output text 2>/dev/null || true)
+
+          if [ -z "${SUBSCRIPTION_ARN:-}" ] || [ "${SUBSCRIPTION_ARN:-}" = "None" ]; then
+            echo "Creating SNS subscription: Topic -> SQS"
+            aws sns subscribe \
+              --topic-arn "$TOPIC_ARN" \
+              --protocol sqs \
+              --notification-endpoint "$QUEUE_ARN" \
+              >/dev/null
+            echo "Subscription created"
+          else
+            echo "Subscription already exists: $SUBSCRIPTION_ARN"
+          fi
+          
       - name: Package Lambda (.NET)
         run: |
           set -euo pipefail
@@ -162,12 +225,11 @@ jobs:
           ls -lah "$GITHUB_WORKSPACE/payments-processor.zip"
 
       - name: Create or Update Lambda
-        env:
-          LAMBDA_FUNCTION_NAME: fcg-payments-processor 
-          LAMBDA_ROLE_ARN: arn:aws:iam::558329071611:role/LabRole
         run: |
           set -euo pipefail
           ZIP="$GITHUB_WORKSPACE/payments-processor.zip"
+          
+          CONN_STR="Server=tech-challenge-payments.cauxpuca0lvv.us-east-1.rds.amazonaws.com,1433;Database=tech-challenge-payments;User Id=admin;Password=FCG_Password;TrustServerCertificate=True;"
 
           if aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" >/dev/null 2>&1; then
             echo "Updating Lambda code: $LAMBDA_FUNCTION_NAME"
@@ -182,8 +244,9 @@ jobs:
             aws lambda update-function-configuration \
               --function-name "$LAMBDA_FUNCTION_NAME" \
               --handler "$LAMBDA_HANDLER" \
-              --timeout 30 \
+              --timeout 300 \
               --memory-size 512 \
+              --environment "Variables={ConnectionStrings__DefaultConnection=$CONN_STR}" \
               >/dev/null
 
             aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME"
@@ -195,15 +258,15 @@ jobs:
               --handler "$LAMBDA_HANDLER" \
               --role "$LAMBDA_ROLE_ARN" \
               --zip-file "fileb://$ZIP" \
-              --timeout 30 \
+              --timeout 300 \
               --memory-size 512 \
+              --environment "Variables={ConnectionStrings__DefaultConnection=$CONN_STR}" \
               --publish \
               >/dev/null
           fi
 
       - name: Ensure SQS -> Lambda trigger (Event Source Mapping)
         env:
-          LAMBDA_FUNCTION_NAME: fcg-payments-processor 
           QUEUE_ARN: ${{ steps.sqs.outputs.QUEUE_ARN }}
         run: |
           set -euo pipefail
@@ -222,13 +285,14 @@ jobs:
               --batch-size 10 \
               --enabled \
               >/dev/null
+            echo "Event source mapping created"
           else
             echo "Event source mapping already exists: $UUID"
           fi
-
-      - name: Update ECS task definition env vars (QueueUrl + Region) and deploy
+          
+      - name: Update ECS task definition (add SNS Topic ARN) and deploy
         env:
-          QUEUE_URL: ${{ steps.sqs.outputs.QUEUE_URL }}
+          TOPIC_ARN: ${{ steps.sns.outputs.TOPIC_ARN }}
         run: |
           set -euo pipefail
 
@@ -243,9 +307,10 @@ jobs:
           TD_JSON=$(aws ecs describe-task-definition \
             --task-definition "$TD_ARN" \
             --query 'taskDefinition')
-
-          NEW_TD=$(echo "$TD_JSON" | jq --arg qk "$ECS_ENV_QUEUE_KEY" --arg qv "$QUEUE_URL" \
-                                       --arg rk "$ECS_ENV_REGION_KEY" --arg rv "$AWS_REGION" '
+            
+          NEW_TD=$(echo "$TD_JSON" | jq \
+            --arg topic "$TOPIC_ARN" \
+            --arg region "$AWS_REGION" '
             del(
               .taskDefinitionArn,
               .revision,
@@ -258,8 +323,11 @@ jobs:
             | .containerDefinitions[0].environment =
                 (
                   (.containerDefinitions[0].environment // [])
-                  | map(select(.name != $qk and .name != $rk))
-                  + [{"name": $qk, "value": $qv}, {"name": $rk, "value": $rv}]
+                  | map(select(.name != "AWS__SNS__PaymentEventsTopicArn" and .name != "AWS__Region"))
+                  + [
+                      {"name": "AWS__SNS__PaymentEventsTopicArn", "value": $topic},
+                      {"name": "AWS__Region", "value": $region}
+                    ]
                 )
           ')
 
@@ -278,10 +346,17 @@ jobs:
             --region "$AWS_REGION" \
             >/dev/null
 
-      - name: Force ECS redeploy (image latest)
+          echo "ECS service updated with new task definition"
+
+      - name: Force ECS redeploy (pull latest image)
         run: |
           aws ecs update-service \
             --cluster "$ECS_CLUSTER" \
             --service "$ECS_SERVICE" \
             --force-new-deployment \
             --region "$AWS_REGION"
+          
+          echo "Deployment complete!"
+          echo "SNS Topic: ${{ steps.sns.outputs.TOPIC_ARN }}"
+          echo "SQS Queue: ${{ steps.sqs.outputs.QUEUE_URL }}"
+          echo "Lambda: $LAMBDA_FUNCTION_NAME"
