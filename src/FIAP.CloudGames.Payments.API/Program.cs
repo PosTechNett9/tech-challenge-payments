@@ -1,3 +1,4 @@
+using Amazon.SimpleNotificationService;
 using Amazon.SQS;
 using FIAP.CloudGames.Payments.API.Extensions;
 using FIAP.CloudGames.Payments.API.Middlewares;
@@ -12,7 +13,6 @@ using FIAP.CloudGames.Payments.Infrastructure.Messaging;
 using FIAP.CloudGames.Payments.Infrastructure.Repositories;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
-using Amazon.SQS;
 using Microsoft.OpenApi.Models;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
@@ -22,6 +22,13 @@ using System.Security.Claims;
 using System.Text;
 
 var builder = WebApplication.CreateBuilder(args);
+
+#region AWS SDK Configuration
+
+builder.Services.AddDefaultAWSOptions(builder.Configuration.GetAWSOptions());
+builder.Services.AddAWSService<IAmazonSimpleNotificationService>();
+
+#endregion
 
 // Swagger
 builder.Services.AddEndpointsApiExplorer();
@@ -46,6 +53,7 @@ Log.Logger = new LoggerConfiguration()
 builder.Host.UseSerilog();
 
 #region Telemetry Configuration
+
 builder.Services.AddOpenTelemetry()
     .WithTracing(tracerProviderBuilder =>
     {
@@ -68,6 +76,7 @@ builder.Services.AddOpenTelemetry()
     });
 
 #endregion
+
 #region Application Services Configuration
 
 builder.Services.AddScoped<IPaymentRepository, PaymentRepository>();
@@ -108,6 +117,21 @@ builder.Services.AddAuthentication("Bearer")
 
 #endregion
 
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<PaymentsDbContext>()
+    .AddCheck("sns-connection", () =>
+    {
+        try
+        {
+            var sns = builder.Services.BuildServiceProvider().GetRequiredService<IAmazonSimpleNotificationService>();
+            return Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Healthy();
+        }
+        catch
+        {
+            return Microsoft.Extensions.Diagnostics.HealthChecks.HealthCheckResult.Unhealthy();
+        }
+    });
+
 var app = builder.Build();
 
 using (var scope = app.Services.CreateScope())
@@ -141,6 +165,7 @@ app.UseMiddleware<ErrorHandlingMiddleware>();
 app.UseMiddleware<CorrelationIdMiddleware>();
 
 app.MapGet("/health", () => Results.Ok("OK")).AllowAnonymous();
+app.MapGet("/health/ready", () => Results.Ok("OK")).AllowAnonymous();
 
 if (app.Environment.IsDevelopment())
 {
