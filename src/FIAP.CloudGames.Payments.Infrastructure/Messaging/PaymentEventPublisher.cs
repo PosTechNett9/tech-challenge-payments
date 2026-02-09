@@ -1,10 +1,10 @@
 ﻿using Amazon.SimpleNotificationService;
 using Amazon.SimpleNotificationService.Model;
-using Amazon.SQS.Model;
 using FIAP.CloudGames.Payments.Domain.Entities;
 using FIAP.CloudGames.Payments.Domain.Interfaces;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
+using System.Globalization;
 using System.Text.Json;
 
 namespace FIAP.CloudGames.Payments.Infrastructure.Messaging
@@ -61,7 +61,7 @@ namespace FIAP.CloudGames.Payments.Infrastructure.Messaging
                             new Amazon.SimpleNotificationService.Model.MessageAttributeValue
                             {
                                 DataType = "Number",
-                                StringValue = payment.Amount.ToString("F2")
+                                StringValue = payment.Amount.ToString("F2", CultureInfo.InvariantCulture)
                             }
                         }
                     },
