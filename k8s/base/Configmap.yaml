@@ -5,6 +5,7 @@ metadata:
   namespace: production
 data:
   # Application Settings
+  DOTNET_SYSTEM_GLOBALIZATION_INVARIANT: "false"
   ASPNETCORE_ENVIRONMENT: "Development"
   ASPNETCORE_URLS: "http://+:8080"
   
