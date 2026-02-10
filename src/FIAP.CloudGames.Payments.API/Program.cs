@@ -11,6 +11,7 @@ using FIAP.CloudGames.Payments.Infrastructure.Context;
 using FIAP.CloudGames.Payments.Infrastructure.Logging;
 using FIAP.CloudGames.Payments.Infrastructure.Messaging;
 using FIAP.CloudGames.Payments.Infrastructure.Repositories;
+using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
@@ -190,6 +191,15 @@ if (app.Environment.IsDevelopment())
     });
 }
 
+app.MapHealthChecks("/health/live", new HealthCheckOptions
+{
+    Predicate = _ => false // Apenas verifica se a aplicação está rodando
+});
+
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready") // Verifica dependências
+});
 
 app.UseHttpsRedirection();
 app.UseSerilogRequestLogging();
