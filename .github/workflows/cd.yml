@@ -1,36 +1,36 @@
-name: CD - Deploy
+name: CD - Deploy to Kubernetes
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  EKS_CLUSTER_NAME: cloudgames-cluster
+  
+  # SNS Topic
+  SNS_TOPIC_NAME: fcg-payment-events
+  
+  # SQS Queue
+  SQS_QUEUE_NAME: fcg-payment-events-queue
+  
+  # Lambda
+  LAMBDA_FUNCTION_NAME: fcg-payments-processor
+  LAMBDA_HANDLER: PaymentsProcessor.Function::PaymentsProcessor.Function.Function::FunctionHandler
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-
-    env:
-      AWS_REGION: us-east-1
-      
-      # SNS Topic
-      SNS_TOPIC_NAME: fcg-payment-events
-      
-      # SQS Queue
-      SQS_QUEUE_NAME: fcg-payment-events-queue
-      
-      # Lambda
-      LAMBDA_FUNCTION_NAME: fcg-payments-processor
-      LAMBDA_HANDLER: PaymentsProcessor.Function::PaymentsProcessor.Function.Function::FunctionHandler
-      
-      # ECS
-      ECS_CLUSTER: fcg-cluster
-      ECS_SERVICE: fcg-payments-task-service-rfv89au5
-
+    
     steps:
+      # 1. Checkout
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Instalar SDK do .NET
+      # 2. .NET Build e Test
+      - name: Install .NET SDK
         uses: actions/setup-dotnet@v3
         with:
           dotnet-version: '8.0.x'
@@ -44,6 +44,7 @@ jobs:
       - name: Run tests
         run: dotnet test --configuration Release --no-build --verbosity normal
 
+      # 3. Docker Build, Scan e Push
       - name: Docker Login
         uses: docker/login-action@v3.6.0
         with:
@@ -53,7 +54,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build image (local)
+      - name: Build Docker image
         uses: docker/build-push-action@v6.18.0
         with:
           context: .
@@ -72,9 +73,10 @@ jobs:
           severity: CRITICAL
           ignore-unfixed: true
 
-      - name: Push image
+      - name: Push image to Docker Hub
         run: docker push ${{ secrets.DOCKER_USERNAME }}/tech-challenge-payments-alpine:latest
 
+      # 4. AWS e Kubernetes Setup
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -83,13 +85,29 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: us-east-1
 
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure kubectl for EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region ${{ env.AWS_REGION }} \
+            --name ${{ env.EKS_CLUSTER_NAME }}
+          
+          kubectl cluster-info
+          kubectl get nodes
+
+      # 5. Install Lambda tools and jq
       - name: Install tools (Lambda + jq)
         run: |
           dotnet tool install -g Amazon.Lambda.Tools
           echo "/home/runner/.dotnet/tools" >> $GITHUB_PATH
           sudo apt-get update
           sudo apt-get install -y jq
-          
+
+      # 6. Create/Update SNS Topic
       - name: Ensure SNS Topic
         id: sns
         run: |
@@ -110,6 +128,7 @@ jobs:
 
           echo "TOPIC_ARN=$TOPIC_ARN" >> $GITHUB_OUTPUT
 
+      # 7. Create/Update SQS Queue
       - name: Ensure SQS Queue
         id: sqs
         run: |
@@ -142,7 +161,8 @@ jobs:
           echo "QUEUE_URL=$QUEUE_URL" >> $GITHUB_OUTPUT
           echo "QUEUE_ARN=$QUEUE_ARN" >> $GITHUB_OUTPUT
 
-      - name: Configure SQS Queue Policy (allow SNS to send messages)
+      # 8. Configure SQS Policy
+      - name: Configure SQS Queue Policy
         env:
           TOPIC_ARN: ${{ steps.sns.outputs.TOPIC_ARN }}
           QUEUE_URL: ${{ steps.sqs.outputs.QUEUE_URL }}
@@ -191,6 +211,7 @@ jobs:
 
           echo "SQS policy configured to accept messages from SNS"
 
+      # 9. Subscribe SQS to SNS
       - name: Subscribe SQS to SNS Topic
         env:
           TOPIC_ARN: ${{ steps.sns.outputs.TOPIC_ARN }}
@@ -198,7 +219,6 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Verifica se a subscription j� existe
           SUBSCRIPTION_ARN=$(aws sns list-subscriptions-by-topic \
             --topic-arn "$TOPIC_ARN" \
             --query "Subscriptions[?Endpoint=='$QUEUE_ARN'].SubscriptionArn" \
@@ -213,15 +233,15 @@ jobs:
               >/dev/null
             echo "Subscription created"
           else
-            echo "Subscription already exists: $SUBSCRIPTION_ARN"
+            echo "Subscription already exists"
           fi
-          
-      - name: Package Lambda (.NET)
+
+      # 10. Package and Deploy Lambda
+      - name: Package Lambda
         run: |
           set -euo pipefail
           cd serverless/PaymentsProcessor.Function/src/PaymentsProcessor.Function
           dotnet lambda package -c Release -o "$GITHUB_WORKSPACE/payments-processor.zip"
-          ls -lah "$GITHUB_WORKSPACE/payments-processor.zip"
 
       - name: Create or Update Lambda
         env:
@@ -231,11 +251,9 @@ jobs:
           ZIP="$GITHUB_WORKSPACE/payments-processor.zip"
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           DYNAMIC_ROLE_ARN="arn:aws:iam::$ACCOUNT_ID:role/LabRole"
-          
-          echo "Using Role ARN: $DYNAMIC_ROLE_ARN"
 
           if aws lambda get-function --function-name "$LAMBDA_FUNCTION_NAME" >/dev/null 2>&1; then
-            echo "Updating Lambda code: $LAMBDA_FUNCTION_NAME"
+            echo "Updating Lambda code"
             aws lambda update-function-code \
               --function-name "$LAMBDA_FUNCTION_NAME" \
               --zip-file "fileb://$ZIP" \
@@ -255,7 +273,7 @@ jobs:
 
             aws lambda wait function-updated --function-name "$LAMBDA_FUNCTION_NAME"
           else
-            echo "Creating Lambda: $LAMBDA_FUNCTION_NAME"
+            echo "Creating Lambda"
             aws lambda create-function \
               --function-name "$LAMBDA_FUNCTION_NAME" \
               --runtime dotnet8 \
@@ -269,7 +287,8 @@ jobs:
               >/dev/null
           fi
 
-      - name: Ensure SQS -> Lambda trigger (Event Source Mapping)
+      # 11. Configure Lambda Trigger
+      - name: Ensure SQS -> Lambda trigger
         env:
           QUEUE_ARN: ${{ steps.sqs.outputs.QUEUE_ARN }}
         run: |
@@ -282,7 +301,7 @@ jobs:
             --output text)
 
           if [ -z "${UUID:-}" ] || [ "$UUID" = "None" ]; then
-            echo "Creating event source mapping SQS -> Lambda"
+            echo "Creating event source mapping"
             aws lambda create-event-source-mapping \
               --function-name "$LAMBDA_FUNCTION_NAME" \
               --event-source-arn "$QUEUE_ARN" \
@@ -293,74 +312,101 @@ jobs:
           else
             echo "Event source mapping already exists: $UUID"
           fi
-          
-      - name: Update ECS task definition (add SNS Topic ARN) and deploy
+
+      # 12. Deploy to Kubernetes
+      - name: Create namespace
+        run: |
+          kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Update Docker image
+        run: |
+          sed -i "s|YOUR_DOCKER_USERNAME|${{ secrets.DOCKER_USERNAME }}|g" k8s/base/Deployment_simple.yaml
+          grep "image:" k8s/base/Deployment_simple.yaml
+
+      - name: Create Kubernetes Secrets
         env:
           TOPIC_ARN: ${{ steps.sns.outputs.TOPIC_ARN }}
         run: |
-          set -euo pipefail
+          kubectl create secret generic payments-service-secrets \
+            --from-literal='ConnectionStrings__DefaultConnection=${{ secrets.PAYMENTS_CONNECTION_STRING }}' \
+            --from-literal='JwtSettings__Secret=${{ secrets.JWT_SECRET }}' \
+            --from-literal='AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}' \
+            --from-literal='AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}' \
+            --from-literal='AWS__SNS__PaymentEventsTopicArn='"$TOPIC_ARN" \
+            --namespace=production \
+            --dry-run=client -o yaml | kubectl apply -f -
 
-          TD_ARN=$(aws ecs describe-services \
-            --cluster "$ECS_CLUSTER" \
-            --services "$ECS_SERVICE" \
-            --query 'services[0].taskDefinition' \
-            --output text)
-
-          echo "Current task definition: $TD_ARN"
-
-          TD_JSON=$(aws ecs describe-task-definition \
-            --task-definition "$TD_ARN" \
-            --query 'taskDefinition')
-            
-          NEW_TD=$(echo "$TD_JSON" | jq \
-            --arg topic "$TOPIC_ARN" \
-            --arg region "$AWS_REGION" '
-            del(
-              .taskDefinitionArn,
-              .revision,
-              .status,
-              .requiresAttributes,
-              .compatibilities,
-              .registeredAt,
-              .registeredBy
-            )
-            | .containerDefinitions[0].environment =
-                (
-                  (.containerDefinitions[0].environment // [])
-                  | map(select(.name != "AWS__SNS__PaymentEventsTopicArn" and .name != "AWS__Region"))
-                  + [
-                      {"name": "AWS__SNS__PaymentEventsTopicArn", "value": $topic},
-                      {"name": "AWS__Region", "value": $region}
-                    ]
-                )
-          ')
-
-          NEW_TD_ARN=$(aws ecs register-task-definition \
-            --cli-input-json "$NEW_TD" \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-
-          echo "New task definition: $NEW_TD_ARN"
-
-          aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$ECS_SERVICE" \
-            --task-definition "$NEW_TD_ARN" \
-            --force-new-deployment \
-            --region "$AWS_REGION" \
-            >/dev/null
-
-          echo "ECS service updated with new task definition"
-
-      - name: Force ECS redeploy (pull latest image)
+      - name: Deploy ConfigMap
         run: |
-          aws ecs update-service \
-            --cluster "$ECS_CLUSTER" \
-            --service "$ECS_SERVICE" \
-            --force-new-deployment \
-            --region "$AWS_REGION"
+          kubectl apply -f k8s/base/Configmap.yaml -n production
+
+      - name: Deploy Application
+        run: |
+          kubectl apply -f k8s/base/Deployment_simple.yaml -n production
+          kubectl rollout status deployment/payments-service -n production --timeout=5m
+
+      - name: Deploy Service
+        run: |
+          kubectl apply -f k8s/base/Service.yaml -n production
+
+      - name: Deploy HPA
+        run: |
+          kubectl apply -f k8s/base/Hpa.yaml -n production
+
+      # 13. Verify Deployment
+      - name: Verify deployment
+        run: |
+          echo "======================================"
+          echo "✅ DEPLOYMENT CONCLUÍDO"
+          echo "======================================"
+          echo ""
           
-          echo "Deployment complete!"
+          echo "=== PODS ==="
+          kubectl get pods -n production -l app=payments-service -o wide
+          echo ""
+          
+          echo "=== SERVICES ==="
+          kubectl get svc -n production
+          echo ""
+          
+          echo "=== HPA ==="
+          kubectl get hpa -n production
+          echo ""
+          
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+          NODE_PORT=$(kubectl get svc payments-service -n production -o jsonpath='{.spec.ports[0].nodePort}')
+          
+          echo "=== API URL ==="
+          echo "API: http://$NODE_IP:$NODE_PORT"
+          echo "Health: http://$NODE_IP:$NODE_PORT/payments/health/live"
+          echo "Swagger: http://$NODE_IP:$NODE_PORT/payments/swagger"
+          echo ""
+          
+          echo "=== SERVERLESS ==="
           echo "SNS Topic: ${{ steps.sns.outputs.TOPIC_ARN }}"
           echo "SQS Queue: ${{ steps.sqs.outputs.QUEUE_URL }}"
           echo "Lambda: $LAMBDA_FUNCTION_NAME"
+
+      # 14. Health Check
+      - name: Health Check
+        continue-on-error: true
+        run: |
+          sleep 30
+          
+          NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="ExternalIP")].address}')
+          NODE_PORT=$(kubectl get svc payments-service -n production -o jsonpath='{.spec.ports[0].nodePort}')
+          
+          if [ -n "$NODE_IP" ] && [ -n "$NODE_PORT" ]; then
+            echo "Testing health endpoint..."
+            
+            for i in {1..5}; do
+              if curl -f -s "http://${NODE_IP}:${NODE_PORT}/payments/health/live" > /dev/null 2>&1; then
+                echo "✅ Health check passed!"
+                exit 0
+              fi
+              echo "Attempt $i failed, waiting..."
+              sleep 10
+            done
+            
+            echo "⚠️ Health check did not pass"
+          fi
